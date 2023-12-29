@@ -14,11 +14,16 @@ const (
 	META_COMMAND_SUCCESS              = "META_COMMAND_SUCCESS"
 	META_COMMAND_FAIL                 = "META_COMMAND_FAIL"
 	META_COMMAND_UNRECOGNIZED_COMMAND = "META_COMMAND_UNRECOGNIZED_COMMAND"
-	PREPARE_SUCCESS                   = "PREPARE_SUCCESS"
-	PREPARE_UNRECOGNIZED_STATEMENT    = "PREPARE_UNRECOGNIZED_STATEMENT"
-	PREPARE_SYNTAX_ERROR              = "PREPARE_SYNTAX_ERROR"
-	STATEMENT_INSERT                  = "STATEMENT_INSERT"
-	STATEMENT_SELECT                  = "STATEMENT_SELECT"
+	META_COMMAND_EXIT                 = "META_COMMAND_EXIT"
+
+	PREPARE_SUCCESS                = "PREPARE_SUCCESS"
+	PREPARE_UNRECOGNIZED_STATEMENT = "PREPARE_UNRECOGNIZED_STATEMENT"
+	PREPARE_SYNTAX_ERROR           = "PREPARE_SYNTAX_ERROR"
+	// PREPARE_NEGATIVE_ID            = "PREPARE_NEGATIVE_ID" // NOTE: Not needed since Regex will not match negative numbers
+	PREPARE_STRING_TOO_LONG = "PREPARE_STRING_TOO_LONG"
+
+	STATEMENT_INSERT = "STATEMENT_INSERT"
+	STATEMENT_SELECT = "STATEMENT_SELECT"
 )
 
 const (
@@ -49,8 +54,8 @@ const (
 
 type Row struct {
 	Id       uint32
-	Username [COLUMN_USERNAME_SIZE]rune
-	Email    [COLUMN_EMAIL_SIZE]rune
+	Username [COLUMN_USERNAME_SIZE + 1]rune
+	Email    [COLUMN_EMAIL_SIZE + 1]rune
 }
 
 type Statement struct {
@@ -63,8 +68,14 @@ type Table struct {
 	Pages   [TABLE_MAX_PAGES][]byte
 }
 
+func trimNullCharacters(input string) string {
+	return strings.Trim(input, "\x00")
+}
+
 func printRow(row *Row) {
-	fmt.Printf("(%d, %s, %s)\n", row.Id, string(row.Username[:]), string(row.Email[:]))
+	stringifiedUsername := trimNullCharacters(string(row.Username[:]))
+	stringifiedEmail := trimNullCharacters(string(row.Email[:]))
+	fmt.Printf("(%d, %s, %s)\n", row.Id, stringifiedUsername, stringifiedEmail)
 }
 
 func createTable() *Table {
@@ -106,7 +117,7 @@ func rowSlot(table *Table, rowNum uint32) []byte {
 
 func doMetaCommand(input string, table *Table) string {
 	if input == ".exit" {
-		os.Exit(0)
+		return META_COMMAND_EXIT
 	}
 	return META_COMMAND_UNRECOGNIZED_COMMAND
 }
@@ -115,14 +126,14 @@ func prepareStatement(input string, statement *Statement) string {
 	if input[:6] == "insert" {
 		regexPattern := `^insert (\d+) (\S+) (\S+)$`
 		re := regexp.MustCompile(regexPattern)
-
 		match := re.FindStringSubmatch(input)
 
 		if match == nil {
 			return PREPARE_SYNTAX_ERROR
 		}
 
-		id, err := strconv.ParseUint(match[1], 10, 32)
+		id, err := strconv.Atoi(match[1])
+
 		if err != nil {
 			return PREPARE_SYNTAX_ERROR
 		}
@@ -130,12 +141,16 @@ func prepareStatement(input string, statement *Statement) string {
 		username := match[2]
 		email := match[3]
 
+		if len(username) > COLUMN_USERNAME_SIZE || len(email) > COLUMN_EMAIL_SIZE {
+			return PREPARE_STRING_TOO_LONG
+		}
+
 		statement.Type = STATEMENT_INSERT
 
-		usernameRunes := [COLUMN_USERNAME_SIZE]rune{}
+		usernameRunes := [COLUMN_USERNAME_SIZE + 1]rune{}
 		copy(usernameRunes[:], []rune(username))
 
-		emailRunes := [COLUMN_EMAIL_SIZE]rune{}
+		emailRunes := [COLUMN_EMAIL_SIZE + 1]rune{}
 		copy(emailRunes[:], []rune(email))
 
 		statement.RowToInsert = Row{
@@ -191,6 +206,7 @@ func executeStatement(statement *Statement, table *Table) string {
 func main() {
 	table := createTable()
 	reader := bufio.NewReader(os.Stdin)
+	exitFlag := false
 	for {
 		fmt.Print("db > ") // Prompt
 
@@ -210,7 +226,14 @@ func main() {
 			case (META_COMMAND_UNRECOGNIZED_COMMAND):
 				fmt.Println("Unrecognized command: ", trimmedInput)
 				continue
+			case (META_COMMAND_EXIT):
+				exitFlag = true
+				break
 			}
+		}
+
+		if exitFlag {
+			return
 		}
 
 		var statement Statement
@@ -223,6 +246,12 @@ func main() {
 		case (PREPARE_UNRECOGNIZED_STATEMENT):
 			fmt.Println("Unrecognized keyword at start of: ", trimmedInput)
 			continue
+		case (PREPARE_STRING_TOO_LONG):
+			fmt.Println("String is too long.")
+			continue
+			// case (PREPARE_NEGATIVE_ID):
+			// 	fmt.Println("ID must be positive.")
+			// 	continue
 		}
 
 		switch executeStatement(&statement, table) {
