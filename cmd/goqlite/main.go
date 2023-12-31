@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -38,11 +39,12 @@ const (
 )
 
 const (
-	ID_SIZE         = 4
+	ID_SIZE       = 4
+	USERNAME_SIZE = 32
+	EMAIL_SIZE    = 255
+
 	ID_OFFSET       = 0
-	USERNAME_SIZE   = 32
-	USERNAME_OFFSET = 4
-	EMAIL_SIZE      = 255
+	USERNAME_OFFSET = ID_OFFSET + ID_SIZE
 	EMAIL_OFFSET    = USERNAME_OFFSET + USERNAME_SIZE
 	ROW_SIZE        = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE
 
@@ -50,6 +52,17 @@ const (
 	TABLE_MAX_PAGES = 100
 	ROWS_PER_PAGE   = PAGE_SIZE / ROW_SIZE
 	TABLE_MAX_ROWS  = ROWS_PER_PAGE * TABLE_MAX_PAGES
+)
+
+const (
+	DEFAULT_FILE_MODE = os.FileMode(0644)
+)
+
+const (
+	O_RDWR  = syscall.O_RDWR
+	O_CREAT = syscall.O_CREAT
+	S_IWUSR = syscall.S_IWUSR
+	S_IRUSR = syscall.S_IRUSR
 )
 
 type Row struct {
@@ -63,14 +76,32 @@ type Statement struct {
 	RowToInsert Row
 }
 
+type Pager struct {
+	FileDescriptor int
+	FileLength     uint32
+	Pages          [TABLE_MAX_PAGES][]byte
+}
+
 type Table struct {
 	NumRows uint32
-	Pages   [TABLE_MAX_PAGES][]byte
+	Pager   *Pager
 }
 
 func trimNullCharacters(input string) string {
 	return strings.Trim(input, "\x00")
 }
+
+// func trimNullCharacters(input []rune) []rune {
+// 	var result []rune
+
+// 	for _, r := range input {
+// 		if r != 0 {
+// 			result = append(result, r)
+// 		}
+// 	}
+
+// 	return result
+// }
 
 func printRow(row *Row) {
 	stringifiedUsername := trimNullCharacters(string(row.Username[:]))
@@ -78,52 +109,175 @@ func printRow(row *Row) {
 	fmt.Printf("(%d, %s, %s)\n", row.Id, stringifiedUsername, stringifiedEmail)
 }
 
-func createTable() *Table {
-	table := &Table{NumRows: 0}
+// func createTable() *Table {
+// 	table := &Table{NumRows: 0}
 
-	for i := range table.Pages {
-		table.Pages[i] = make([]byte, PAGE_SIZE)
+// 	for i := range table.Pages {
+// 		table.Pages[i] = make([]byte, PAGE_SIZE)
+// 	}
+
+// 	return table
+// }
+
+func pagerOpen(fileName string) *Pager {
+	fd, err := syscall.Open(fileName, O_RDWR|O_CREAT, S_IWUSR|S_IRUSR)
+	fmt.Println("File descriptor: ", fd)
+	if err != nil {
+		fmt.Println("Unable to open file")
+		os.Exit(1)
 	}
 
+	fileLength, err := syscall.Seek(fd, 0, os.SEEK_END)
+	if err != nil {
+		fmt.Println("Error getting file length")
+		os.Exit(1)
+	}
+
+	// fileLength, err := os.Stat(fileName)
+	// if err != nil {
+	// 	fmt.Println("Error getting file length")
+	// 	os.Exit(1)
+	// }
+
+	pager := &Pager{
+		FileDescriptor: fd,
+		FileLength:     uint32(fileLength),
+	}
+
+	for i := 0; i < TABLE_MAX_PAGES; i++ {
+		pager.Pages[i] = nil
+	}
+
+	return pager
+}
+
+func dbOpen(fileName string) *Table {
+	pager := pagerOpen(fileName)
+	fmt.Println("File length: ", pager.FileLength)
+	numRows := pager.FileLength / ROW_SIZE
+	fmt.Println("Num rows: ", numRows)
+
+	table := &Table{NumRows: numRows, Pager: pager}
 	return table
+}
+
+func pagerFlush(pager *Pager, pageNum uint32, size uint32) {
+	if pager.Pages[pageNum] == nil {
+		fmt.Println("Tried to flush null page.")
+		os.Exit(1)
+	}
+
+	offset, err := syscall.Seek(pager.FileDescriptor, int64(pageNum*PAGE_SIZE), os.SEEK_SET)
+	if err != nil || offset == -1 {
+		fmt.Println("Error seeking: ", err)
+		os.Exit(1)
+	}
+
+	bytesWritten, err := syscall.Write(pager.FileDescriptor, pager.Pages[pageNum])
+	if bytesWritten == 0 || err != nil {
+		fmt.Println("Error writing: ", err)
+		os.Exit(1)
+	}
+}
+
+func dbClose(table *Table) {
+	pager := table.Pager
+	numFullPages := table.NumRows / ROWS_PER_PAGE
+
+	var i uint32
+	fmt.Println("Num full pages: ", numFullPages)
+	for i = 0; i < numFullPages; i++ {
+		if pager.Pages[i] == nil {
+			continue
+		}
+		pagerFlush(pager, i, PAGE_SIZE)
+		pager.Pages[i] = nil
+	}
+
+	numAdditionalRows := table.NumRows % ROWS_PER_PAGE
+	fmt.Println("Num additional rows: ", numAdditionalRows)
+	if numAdditionalRows > 0 {
+		pageNum := numFullPages
+		if pager.Pages[pageNum] != nil {
+			pagerFlush(pager, pageNum, numAdditionalRows*ROW_SIZE)
+			pager.Pages[pageNum] = nil
+		}
+	}
+
+	result := syscall.Close(pager.FileDescriptor)
+	if result != nil {
+		fmt.Println("Error closing db file.")
+		os.Exit(1)
+	}
+
+	for i = 0; i < TABLE_MAX_PAGES; i++ {
+		page := pager.Pages[i]
+		if page != nil {
+			pager.Pages[i] = nil
+		}
+	}
 }
 
 func serializeRow(source *Row, destination *[]byte) {
 	binary.LittleEndian.PutUint32((*destination)[ID_OFFSET:ID_OFFSET+ID_SIZE], source.Id)
-	copy((*destination)[USERNAME_OFFSET:USERNAME_OFFSET+USERNAME_SIZE], []byte(string(source.Username[:])))
-	copy((*destination)[EMAIL_OFFSET:EMAIL_OFFSET+EMAIL_SIZE], []byte(string(source.Email[:])))
+	copy((*destination)[USERNAME_OFFSET:USERNAME_OFFSET+USERNAME_SIZE], []byte(trimNullCharacters(string(source.Username[:]))))
+	copy((*destination)[EMAIL_OFFSET:EMAIL_OFFSET+EMAIL_SIZE], []byte(trimNullCharacters(string(source.Email[:]))))
 }
 
 func deserializeRow(source []byte, destination *Row) {
 	destination.Id = binary.LittleEndian.Uint32(source[ID_OFFSET : ID_OFFSET+ID_SIZE])
-	copy(destination.Username[:], []rune(string(source[USERNAME_OFFSET:USERNAME_OFFSET+USERNAME_SIZE])))
-	copy(destination.Email[:], []rune(string(source[EMAIL_OFFSET:EMAIL_OFFSET+EMAIL_SIZE])))
+	copy(destination.Username[:], []rune(trimNullCharacters(string(source[USERNAME_OFFSET:USERNAME_OFFSET+USERNAME_SIZE]))))
+	copy(destination.Email[:], []rune(trimNullCharacters(string(source[EMAIL_OFFSET:EMAIL_OFFSET+EMAIL_SIZE]))))
+}
+
+func getPage(pager *Pager, pageNum uint32) []byte {
+	if pageNum > TABLE_MAX_PAGES {
+		fmt.Println("Tried to fetch page number out of bounds.")
+		os.Exit(1)
+	}
+
+	if pager.Pages[pageNum] == nil {
+		page := make([]byte, PAGE_SIZE)
+		numPages := pager.FileLength / PAGE_SIZE
+
+		if pager.FileLength%PAGE_SIZE != 0 {
+			numPages += 1
+		}
+
+		if pageNum <= numPages {
+			_, err := syscall.Seek(pager.FileDescriptor, int64(pageNum*PAGE_SIZE), os.SEEK_SET)
+			bytesRead, _ := syscall.Read(pager.FileDescriptor, page)
+			if err != nil || bytesRead == -1 {
+				fmt.Println("Error reading file: ", err)
+				os.Exit(1)
+			}
+		}
+		pager.Pages[pageNum] = page
+	}
+
+	return pager.Pages[pageNum]
 }
 
 func rowSlot(table *Table, rowNum uint32) []byte {
 	pageNum := rowNum / ROWS_PER_PAGE
-	page := table.Pages[pageNum]
 
-	if page == nil {
-		page = make([]byte, PAGE_SIZE)
-		table.Pages[pageNum] = page
-	}
-
+	page := getPage(table.Pager, pageNum)
 	rowOffset := rowNum % ROWS_PER_PAGE
 	byteOffset := rowOffset * ROW_SIZE
 
-	return page[byteOffset : byteOffset+ROW_SIZE]
+	return page[byteOffset:]
 }
 
 func doMetaCommand(input string, table *Table) string {
 	if input == ".exit" {
+		dbClose(table)
 		return META_COMMAND_EXIT
 	}
 	return META_COMMAND_UNRECOGNIZED_COMMAND
 }
 
 func prepareStatement(input string, statement *Statement) string {
-	if input[:6] == "insert" {
+	if len(input) >= 6 && input[:6] == "insert" {
 		regexPattern := `^insert (\d+) (\S+) (\S+)$`
 		re := regexp.MustCompile(regexPattern)
 		match := re.FindStringSubmatch(input)
@@ -170,6 +324,7 @@ func prepareStatement(input string, statement *Statement) string {
 }
 
 func executeInsert(statement *Statement, table *Table) string {
+	fmt.Println("Table rows: ", table.NumRows)
 	if table.NumRows >= TABLE_MAX_ROWS {
 		return EXECUTE_TABLE_FULL
 	}
@@ -188,7 +343,10 @@ func executeSelect(statement *Statement, table *Table) string {
 
 	for i = 0; i < table.NumRows; i++ {
 		deserializeRow(rowSlot(table, i), &row)
-		printRow(&row)
+		if row.Id != 0 {
+			// TODO: Fix this (Temp fix - Note that after db is closed, rows with id = 0 are still added for some reason)
+			printRow(&row)
+		}
 	}
 	return EXECUTE_SUCCESS
 }
@@ -204,7 +362,14 @@ func executeStatement(statement *Statement, table *Table) string {
 }
 
 func main() {
-	table := createTable()
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: ./goqlite DB_FILE_NAME")
+		os.Exit(1)
+	}
+
+	fileName := os.Args[1]
+	table := dbOpen(fileName)
+
 	reader := bufio.NewReader(os.Stdin)
 	exitFlag := false
 	for {
