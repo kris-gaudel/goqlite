@@ -22,6 +22,7 @@ const (
 	PREPARE_SYNTAX_ERROR           = "PREPARE_SYNTAX_ERROR"
 	// PREPARE_NEGATIVE_ID            = "PREPARE_NEGATIVE_ID" // NOTE: Not needed since Regex will not match negative numbers
 	PREPARE_STRING_TOO_LONG = "PREPARE_STRING_TOO_LONG"
+	PREPARE_NON_POSITIVE_ID = "PREPARE_NON_POSITIVE_ID"
 
 	STATEMENT_INSERT = "STATEMENT_INSERT"
 	STATEMENT_SELECT = "STATEMENT_SELECT"
@@ -167,8 +168,8 @@ func pagerFlush(pager *Pager, pageNum uint32, size uint32) {
 		os.Exit(1)
 	}
 
-	offset, err := syscall.Seek(pager.FileDescriptor, int64(pageNum*PAGE_SIZE), os.SEEK_SET)
-	if err != nil || offset == -1 {
+	_, err := syscall.Seek(pager.FileDescriptor, int64(pageNum*PAGE_SIZE), os.SEEK_SET)
+	if err != nil {
 		fmt.Println("Error seeking: ", err)
 		os.Exit(1)
 	}
@@ -220,8 +221,8 @@ func dbClose(table *Table) {
 
 func serializeRow(source *Row, destination *[]byte) {
 	binary.LittleEndian.PutUint32((*destination)[ID_OFFSET:ID_OFFSET+ID_SIZE], source.Id)
-	copy((*destination)[USERNAME_OFFSET:USERNAME_OFFSET+USERNAME_SIZE], []byte(trimNullCharacters(string(source.Username[:]))))
-	copy((*destination)[EMAIL_OFFSET:EMAIL_OFFSET+EMAIL_SIZE], []byte(trimNullCharacters(string(source.Email[:]))))
+	copy((*destination)[USERNAME_OFFSET:USERNAME_OFFSET+USERNAME_SIZE], []byte(trimNullCharacters(string(source.Username[:USERNAME_SIZE]))))
+	copy((*destination)[EMAIL_OFFSET:EMAIL_OFFSET+EMAIL_SIZE], []byte(trimNullCharacters(string(source.Email[:EMAIL_SIZE]))))
 }
 
 func deserializeRow(source []byte, destination *Row) {
@@ -245,10 +246,14 @@ func getPage(pager *Pager, pageNum uint32) []byte {
 		}
 
 		if pageNum <= numPages {
-			_, err := syscall.Seek(pager.FileDescriptor, int64(pageNum*PAGE_SIZE), os.SEEK_SET)
-			bytesRead, _ := syscall.Read(pager.FileDescriptor, page)
-			if err != nil || bytesRead == -1 {
-				fmt.Println("Error reading file: ", err)
+			_, errSeek := syscall.Seek(pager.FileDescriptor, int64(pageNum*PAGE_SIZE), os.SEEK_SET)
+			_, errRead := syscall.Read(pager.FileDescriptor, page)
+			if errSeek != nil {
+				fmt.Println("Error seeking file: ", errSeek)
+				os.Exit(1)
+			}
+			if errRead != nil {
+				fmt.Println("Error reading file: ", errRead)
 				os.Exit(1)
 			}
 		}
@@ -287,6 +292,10 @@ func prepareStatement(input string, statement *Statement) string {
 		}
 
 		id, err := strconv.Atoi(match[1])
+
+		if id <= 0 {
+			return PREPARE_NON_POSITIVE_ID
+		}
 
 		if err != nil {
 			return PREPARE_SYNTAX_ERROR
@@ -330,7 +339,9 @@ func executeInsert(statement *Statement, table *Table) string {
 	}
 
 	rowToInsert := statement.RowToInsert
+
 	rowSlotresult := rowSlot(table, table.NumRows)
+
 	serializeRow(&rowToInsert, &rowSlotresult)
 	table.NumRows += 1
 
@@ -344,7 +355,8 @@ func executeSelect(statement *Statement, table *Table) string {
 	for i = 0; i < table.NumRows; i++ {
 		deserializeRow(rowSlot(table, i), &row)
 		if row.Id != 0 {
-			// TODO: Fix this (Temp fix - Note that after db is closed, rows with id = 0 are still added for some reason)
+			// Note: Figure out why pager considers "junk" entries with ID = 0 to be valid,
+			// can simply filter them out and functions as normal
 			printRow(&row)
 		}
 	}
@@ -414,9 +426,12 @@ func main() {
 		case (PREPARE_STRING_TOO_LONG):
 			fmt.Println("String is too long.")
 			continue
-			// case (PREPARE_NEGATIVE_ID):
-			// 	fmt.Println("ID must be positive.")
-			// 	continue
+		// case (PREPARE_NEGATIVE_ID):
+		// 	fmt.Println("ID must be positive.")
+		// 	continue
+		case (PREPARE_NON_POSITIVE_ID):
+			fmt.Println("ID must be positive")
+			continue
 		}
 
 		switch executeStatement(&statement, table) {
