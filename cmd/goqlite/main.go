@@ -88,37 +88,32 @@ type Table struct {
 	Pager   *Pager
 }
 
+type Cursor struct {
+	Table      *Table
+	RowNum     uint32
+	EndOfTable bool
+}
+
+func tableStart(table *Table) *Cursor {
+	cursor := &Cursor{Table: table, RowNum: 0}
+	cursor.EndOfTable = (table.NumRows == 0)
+	return cursor
+}
+
+func tableEnd(table *Table) *Cursor {
+	cursor := &Cursor{Table: table, RowNum: table.NumRows, EndOfTable: true}
+	return cursor
+}
+
 func trimNullCharacters(input string) string {
 	return strings.Trim(input, "\x00")
 }
-
-// func trimNullCharacters(input []rune) []rune {
-// 	var result []rune
-
-// 	for _, r := range input {
-// 		if r != 0 {
-// 			result = append(result, r)
-// 		}
-// 	}
-
-// 	return result
-// }
 
 func printRow(row *Row) {
 	stringifiedUsername := trimNullCharacters(string(row.Username[:]))
 	stringifiedEmail := trimNullCharacters(string(row.Email[:]))
 	fmt.Printf("(%d, %s, %s)\n", row.Id, stringifiedUsername, stringifiedEmail)
 }
-
-// func createTable() *Table {
-// 	table := &Table{NumRows: 0}
-
-// 	for i := range table.Pages {
-// 		table.Pages[i] = make([]byte, PAGE_SIZE)
-// 	}
-
-// 	return table
-// }
 
 func pagerOpen(fileName string) *Pager {
 	fd, err := syscall.Open(fileName, O_RDWR|O_CREAT, S_IWUSR|S_IRUSR)
@@ -263,14 +258,21 @@ func getPage(pager *Pager, pageNum uint32) []byte {
 	return pager.Pages[pageNum]
 }
 
-func rowSlot(table *Table, rowNum uint32) []byte {
+func cursorValue(cursor *Cursor) []byte {
+	rowNum := cursor.RowNum
 	pageNum := rowNum / ROWS_PER_PAGE
-
-	page := getPage(table.Pager, pageNum)
+	page := getPage(cursor.Table.Pager, pageNum)
 	rowOffset := rowNum % ROWS_PER_PAGE
 	byteOffset := rowOffset * ROW_SIZE
 
 	return page[byteOffset:]
+}
+
+func cursorAdvance(cursor *Cursor) {
+	cursor.RowNum += 1
+	if cursor.RowNum >= cursor.Table.NumRows {
+		cursor.EndOfTable = true
+	}
 }
 
 func doMetaCommand(input string, table *Table) string {
@@ -339,8 +341,9 @@ func executeInsert(statement *Statement, table *Table) string {
 	}
 
 	rowToInsert := statement.RowToInsert
+	cursor := tableEnd(table)
 
-	rowSlotresult := rowSlot(table, table.NumRows)
+	rowSlotresult := cursorValue(cursor)
 
 	serializeRow(&rowToInsert, &rowSlotresult)
 	table.NumRows += 1
@@ -349,17 +352,22 @@ func executeInsert(statement *Statement, table *Table) string {
 }
 
 func executeSelect(statement *Statement, table *Table) string {
+	cursor := tableStart(table)
 	var row Row
-	var i uint32
 
-	for i = 0; i < table.NumRows; i++ {
-		deserializeRow(rowSlot(table, i), &row)
+	for {
+		if cursor.EndOfTable {
+			break
+		}
+		deserializeRow(cursorValue(cursor), &row)
 		if row.Id != 0 {
 			// Note: Figure out why pager considers "junk" entries with ID = 0 to be valid,
 			// can simply filter them out and functions as normal
 			printRow(&row)
 		}
+		cursorAdvance(cursor)
 	}
+
 	return EXECUTE_SUCCESS
 }
 
