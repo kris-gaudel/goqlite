@@ -100,6 +100,7 @@ func LeafNodeValue(nodeInstance []byte, cellNum uint32) []byte {
 }
 
 func InitializeLeafNode(nodeInstance []byte) {
+	SetNodeType(nodeInstance, constants.NODE_LEAF)
 	*LeafNodeNumCells(nodeInstance) = 0
 }
 
@@ -123,6 +124,42 @@ func LeafNodeInsert(cursorInstance *Cursor, key uint32, value *Row) {
 	SerializeRow(value, LeafNodeValue(nodeInstance, cursorInstance.CellNum))
 }
 
+func LeafNodeFind(tableInstance *Table, pageNum uint32, key uint32) *Cursor {
+	node := GetPage(tableInstance.Pager, pageNum)
+	numCells := *LeafNodeNumCells(node)
+
+	cursorInstance := &Cursor{Table: tableInstance, PageNum: pageNum}
+
+	// Binary search
+	minIndex := uint32(0)
+	onePastMaxIndex := numCells
+	for onePastMaxIndex != minIndex {
+		index := (minIndex + onePastMaxIndex) / 2
+		keyAtIndex := *LeafNodeKey(node, index)
+		if key == keyAtIndex {
+			cursorInstance.CellNum = index
+			return cursorInstance
+		}
+		if key < keyAtIndex {
+			onePastMaxIndex = index
+		} else {
+			minIndex = index + 1
+		}
+	}
+	cursorInstance.CellNum = minIndex
+	return cursorInstance
+}
+
+func GetNodeType(nodeInstance []byte) constants.NodeType {
+	value := *(*uint8)(unsafe.Pointer(&nodeInstance[constants.NODE_TYPE_OFFSET]))
+	return constants.NodeType(value)
+}
+
+func SetNodeType(nodeInstance []byte, nodeType constants.NodeType) {
+	value := uint8(nodeType)
+	*(*uint8)(unsafe.Pointer(&nodeInstance[constants.NODE_TYPE_OFFSET])) = value
+}
+
 // Cursor Code
 
 func TableStart(tableInstance *Table) *Cursor {
@@ -134,14 +171,15 @@ func TableStart(tableInstance *Table) *Cursor {
 	return cursor
 }
 
-func TableEnd(table *Table) *Cursor {
-	cursor := &Cursor{Table: table, PageNum: table.RootPageNum}
+func TableFind(tableInstance *Table, key uint32) *Cursor {
+	rootPageNum := tableInstance.RootPageNum
+	rootNode := GetPage(tableInstance.Pager, rootPageNum)
 
-	rootNode := GetPage(table.Pager, table.RootPageNum)
-	numCells := *LeafNodeNumCells(rootNode)
-	cursor.CellNum = numCells
-	cursor.EndOfTable = true
-	return cursor
+	if (GetNodeType(rootNode)) != constants.NODE_LEAF {
+		fmt.Println("Need to implement searching an internal node.")
+		os.Exit(1)
+	}
+	return LeafNodeFind(tableInstance, rootPageNum, key)
 }
 
 func CursorValue(cursor *Cursor) []byte {
@@ -380,12 +418,22 @@ func DoMetaCommand(input string, tableInstance *Table) string {
 
 func ExecuteInsert(statement *Statement, tableInstance *Table) string {
 	node := GetPage(tableInstance.Pager, tableInstance.RootPageNum)
-	if *LeafNodeNumCells(node) >= uint32(constants.LEAF_NODE_MAX_CELLS) {
+	numCells := *LeafNodeNumCells(node)
+	if numCells >= uint32(constants.LEAF_NODE_MAX_CELLS) {
 		return constants.EXECUTE_TABLE_FULL
 	}
 
 	rowToInsert := statement.RowToInsert
-	cursorInstance := TableEnd(tableInstance)
+	keyToInsert := rowToInsert.Id
+	cursorInstance := TableFind(tableInstance, keyToInsert)
+
+	if cursorInstance.CellNum < numCells {
+		keyAtIndex := *LeafNodeKey(node, cursorInstance.CellNum)
+		if keyAtIndex == keyToInsert {
+			return constants.EXECUTE_DUPLICATE_KEY
+		}
+	}
+
 	LeafNodeInsert(cursorInstance, rowToInsert.Id, &rowToInsert)
 
 	return constants.EXECUTE_SUCCESS
@@ -488,6 +536,9 @@ func main() {
 			break
 		case (constants.EXECUTE_TABLE_FULL):
 			fmt.Println("Error: Table full.")
+			break
+		case (constants.EXECUTE_DUPLICATE_KEY):
+			fmt.Println("Error: Duplicate key.")
 			break
 		default:
 			fmt.Println("Default")
