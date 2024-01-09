@@ -145,6 +145,34 @@ func InternalNodeKey(nodeInstance []byte, keyNum uint32) *uint32 {
 	return (*uint32)(unsafe.Pointer(&nodeInstance[offset]))
 }
 
+func InternalNodeFind(tableInstance *Table, pageNum uint32, key uint32) *Cursor {
+	node := GetPage(tableInstance.Pager, pageNum)
+	numKeys := *InternalNodeNumKeys(node)
+
+	minIndex := uint32(0)
+	maxIndex := numKeys
+
+	for minIndex != maxIndex {
+		index := (minIndex + maxIndex) / 2
+		keyToRight := *InternalNodeKey(node, index)
+		if keyToRight >= key {
+			maxIndex = index
+		} else {
+			minIndex = index + 1
+		}
+	}
+
+	childNum := *InternalNodeChild(node, minIndex)
+	child := GetPage(tableInstance.Pager, childNum)
+
+	switch GetNodeType(child) {
+	case constants.NODE_LEAF:
+		return LeafNodeFind(tableInstance, childNum, key)
+	default: // constants.NODE_INTERNAL
+		return InternalNodeFind(tableInstance, childNum, key)
+	}
+}
+
 func GetNodeMaxKey(nodeInstance []byte) uint32 {
 	switch GetNodeType(nodeInstance) {
 	case constants.NODE_INTERNAL:
@@ -343,8 +371,7 @@ func TableFind(tableInstance *Table, key uint32) *Cursor {
 	rootNode := GetPage(tableInstance.Pager, rootPageNum)
 
 	if (GetNodeType(rootNode)) != constants.NODE_LEAF {
-		fmt.Println("Need to implement searching an internal node.")
-		os.Exit(1)
+		return InternalNodeFind(tableInstance, rootPageNum, key)
 	}
 	return LeafNodeFind(tableInstance, rootPageNum, key)
 }
